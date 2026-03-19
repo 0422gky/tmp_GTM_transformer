@@ -94,17 +94,18 @@ def run(args):
     # Forecast the testing set
     model.to(device)
     model.eval()
-    gt, forecasts, attns = [], [],[]
+    # --- add: 去除了这里的 attn ---
+    gt, forecasts = [], []
     for test_data in tqdm(test_loader, total=len(test_loader), ascii=True):
         with torch.no_grad():
             test_data = [tensor.to(device) for tensor in test_data]
             item_sales, category, color, textures, temporal_features, gtrends, images =  test_data
-            y_pred, att = model(category, color,textures, temporal_features, gtrends, images)
+            # y_pred, att = model(category, color,textures, temporal_features, gtrends, images)
+            y_pred = model(category, color, textures, temporal_features, gtrends, images)
+            # --- add --- 
             forecasts.append(y_pred.detach().cpu().numpy().flatten()[:args.output_dim])
             gt.append(item_sales.detach().cpu().numpy().flatten()[:args.output_dim])
-            attns.append(att.detach().cpu().numpy())
-
-    attns = np.stack(attns)
+            # attns不要了
     forecasts = np.array(forecasts)
     gt = np.array(gt)
 
