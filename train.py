@@ -4,6 +4,7 @@ import wandb
 import torch
 import pandas as pd
 import pytorch_lightning as pl
+import inspect
 from pytorch_lightning import loggers as pl_loggers
 from pathlib import Path
 from datetime import datetime
@@ -12,6 +13,18 @@ from models.FCN import FCN
 from utils.data_multitrends import ZeroShotDataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _torch_load_trusted(path: Path):
+    """
+    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
+    本项目的 category/color/fabric label 本质上是 dict/标签映射，通常你是信任该来源的。
+    """
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        # 兼容老版本 PyTorch（没有 weights_only 参数）
+        return torch.load(str(path), map_location="cpu")
 
 
 def run(args):
@@ -24,9 +37,9 @@ def run(args):
     test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
 
     # Load category and color encodings
-    cat_dict = torch.load(Path(args.data_folder + 'category_labels.pt'))
-    col_dict = torch.load(Path(args.data_folder + 'color_labels.pt'))
-    fab_dict = torch.load(Path(args.data_folder + 'fabric_labels.pt'))
+    cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
+    col_dict = _torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
+    fab_dict = _torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
 
     # Load Google trends
     gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
@@ -92,8 +105,27 @@ def run(args):
 
     # If you wish to use Tensorboard you can change the logger to:
     # tb_logger = pl_loggers.TensorBoardLogger(args.log_dir+'/', name=model_savename)
-    trainer = pl.Trainer(gpus=[args.gpu_num], max_epochs=args.epochs, check_val_every_n_epoch=5,
-                         logger=wandb_logger, callbacks=[checkpoint_callback])
+    # Lightning API 兼容：旧版本用 gpus=，新版本用 accelerator/devices=
+    trainer_kwargs = dict(
+        max_epochs=args.epochs,
+        check_val_every_n_epoch=5,
+        logger=wandb_logger,
+        callbacks=[checkpoint_callback],
+    )
+    trainer_sig = inspect.signature(pl.Trainer)
+    if "gpus" in trainer_sig.parameters:
+        trainer_kwargs["gpus"] = [args.gpu_num]
+    else:
+        # 让 devices=1 映射到你指定的卡号
+        if torch.cuda.is_available():
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
+            trainer_kwargs["accelerator"] = "gpu"
+            trainer_kwargs["devices"] = 1
+        else:
+            trainer_kwargs["accelerator"] = "cpu"
+            trainer_kwargs["devices"] = 1
+
+    trainer = pl.Trainer(**trainer_kwargs)
 
     # Fit model
     trainer.fit(model, train_dataloaders=train_loader,
@@ -110,7 +142,7 @@ if __name__ == '__main__':
     parser.add_argument('--data_folder', type=str, default='dataset/')
     parser.add_argument('--log_dir', type=str, default='log')
     parser.add_argument('--seed', type=int, default=21)
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--gpu_num', type=int, default=0)
 
     # Model specific arguments
@@ -119,7 +151,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
     parser.add_argument('--trend_len', type=int, default=52)
-    parser.add_argument('--num_trends', type=int, default=3)
+    parser.add_argument('--num_trends', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--embedding_dim', type=int, default=32)
     parser.add_argument('--hidden_dim', type=int, default=64)
@@ -136,3 +168,4 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     run(args)
+
