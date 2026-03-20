@@ -202,6 +202,10 @@ class TransformerDecoderLayer(nn.Module):
         super(TransformerDecoderLayer, self).__init__()
         
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # PyTorch's nn.TransformerDecoder expects decoder layers to expose `self_attn`
+        # (used only for internal shape bookkeeping). We reuse the same MultiheadAttention
+        # module to satisfy that interface without changing our cross-attention forward.
+        self.self_attn = self.multihead_attn
 
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -220,16 +224,30 @@ class TransformerDecoderLayer(nn.Module):
             state['activation'] = F.relu
         super(TransformerDecoderLayer, self).__setstate__(state)
 
-    def forward(self, tgt, memory, tgt_mask = None, memory_mask = None, tgt_key_padding_mask = None, 
-            memory_key_padding_mask = None):
+    def forward(
+        self,
+        tgt,
+        memory,
+        tgt_mask=None,
+        memory_mask=None,
+        tgt_key_padding_mask=None,
+        memory_key_padding_mask=None,
+        # Newer torch versions may pass these args from nn.TransformerDecoder
+        tgt_is_causal=None,
+        memory_is_causal=None,
+        **kwargs,
+    ):
 
-        tgt2, attn_weights = self.multihead_attn(tgt, memory, memory)
+        # Cross-attention: use `memory` as both key/value.
+        # Note: `nn.TransformerDecoder` expects each decoder layer to return a tensor,
+        # so we drop returning `attn_weights` to keep compatibility across torch versions.
+        tgt2, _ = self.multihead_attn(tgt, memory, memory)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
-        return tgt, attn_weights
+        return tgt
 
 class GTM(pl.LightningModule):
     def __init__(self, embedding_dim, hidden_dim, output_dim, num_heads, num_layers, use_text, use_img, \
@@ -267,7 +285,7 @@ class GTM(pl.LightningModule):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to('cuda:'+str(self.gpu_num))
         return mask
 
-    def forward(self, category, color, fabric, temporal_features, gtrends, images, return_embedding: bool = False): # add return_embedding
+    def forward(self, category, color, fabric, temporal_features, gtrends, images, return_embedding: bool = False):
         # Encode features and get inputs
         img_encoding = self.image_encoder(images)
         dummy_encoding = self.dummy_encoder(temporal_features)
@@ -284,22 +302,18 @@ class GTM(pl.LightningModule):
             tgt = self.pos_encoder(tgt)
             tgt_mask = self._generate_square_subsequent_mask(self.output_len)
             memory = gtrend_encoding
-            # --- add --- 
             decoder_ret = self.decoder(tgt, memory, tgt_mask)
             # Some PyTorch versions may return (output, attn_weights); handle both.
             decoder_out = decoder_ret[0] if isinstance(decoder_ret, tuple) else decoder_ret
-            # --- add ---
             forecast = self.decoder_fc(decoder_out)
         else:
             # Decode (generatively/non-autoregressively)
             tgt = static_feature_fusion.unsqueeze(0)
             memory = gtrend_encoding
-            # --- add ---
             decoder_ret = self.decoder(tgt, memory)
             decoder_out = decoder_ret[0] if isinstance(decoder_ret, tuple) else decoder_ret
-            # --- add ---
             forecast = self.decoder_fc(decoder_out)
-        # --- alter the output --- add --- 这里的fused feature就是我们想要的融合特征矩阵
+
         pred = forecast.view(-1, self.output_len)
         if return_embedding:
             # Cross-attention output / multi-modal fused representation.
@@ -307,7 +321,6 @@ class GTM(pl.LightningModule):
             fused_feature = decoder_out.transpose(0, 1)
             return pred, fused_feature
         return pred
-        # --- add ---
 
     def configure_optimizers(self):
         optimizer = Adafactor(self.parameters(),scale_parameter=True, relative_step=True, warmup_init=True, lr=None)
@@ -339,3 +352,4 @@ class GTM(pl.LightningModule):
         self.log('val_loss', loss)
 
         print('Validation MAE:', mae.detach().cpu().numpy(), 'LR:', self.optimizers().param_groups[0]['lr'])
+
